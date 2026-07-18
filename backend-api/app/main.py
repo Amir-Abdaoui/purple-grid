@@ -156,8 +156,8 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     expires_in: int
 
-
 class ScanRequest(BaseModel):
+    min_severity: Literal["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"] = "MEDIUM"
     repo_url: HttpUrl
     branch: str = "main"
     scan_depth: Literal["shallow", "full"] = "full"
@@ -168,7 +168,6 @@ class ScanRequest(BaseModel):
         if ".." in v or "/" in v:
             raise ValueError("Branch name must not contain path traversal sequences.")
         return v
-
 
 class Vulnerability(BaseModel):
     finding_id: str          # was cve_id — static analysis finds CWEs, not CVEs
@@ -308,8 +307,17 @@ async def scan_repository(
 
     try:
         scan = await scanner.run_scan(str(payload.repo_url), payload.branch, payload.scan_depth)
-        findings = [Vulnerability(**v) for v in scan["vulnerabilities"]]
+        SEVERITY_RANK = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
+
+        all_findings = [Vulnerability(**v) for v in scan["vulnerabilities"]]
         duration_ms = scan["duration_ms"]
+
+# Filter by min_severity then sort highest first
+        findings = [
+            f for f in all_findings
+            if SEVERITY_RANK.get(f.severity, 0) >= SEVERITY_RANK[payload.min_severity]
+        ]
+        findings.sort(key=lambda f: SEVERITY_RANK.get(f.severity, 0), reverse=True)
     except scanner.ScanError as exc:
         logger.warning(f"scan_rejected scan_id={scan_id} reason={exc}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
