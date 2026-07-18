@@ -1,11 +1,6 @@
 """
 Purple-Grid — AI-Powered Vulnerability Scanner API
-Backend Microservice · Phase 1 Stub
-
-Security posture:
-- No secrets in source; all config injected via environment variables.
-- Structured JSON logging for SIEM ingestion.
-- Health & readiness probes for container orchestration (Kubernetes / ECS).
+Backend Microservice · Phase 3 — PostgreSQL Persistence
 """
 
 from __future__ import annotations
@@ -15,16 +10,25 @@ import os
 import random
 import time
 import uuid
-from datetime import datetime, timezone
-from typing import Literal
+from app import scanner
+from datetime import datetime, timedelta, timezone
+from typing import Literal, AsyncGenerator
 
-from fastapi import FastAPI, HTTPException, Request, status
+import bcrypt
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, HttpUrl, field_validator
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError, jwt
+from pydantic import BaseModel, EmailStr, HttpUrl, field_validator
+from sqlalchemy import text, Boolean, Column, DateTime, Integer, Numeric, String, ForeignKey
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.future import select
 
 # ---------------------------------------------------------------------------
-# Structured logging — output to stdout so the container runtime captures it.
+# Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -34,23 +38,82 @@ logging.basicConfig(
 logger = logging.getLogger("purple-grid")
 
 # ---------------------------------------------------------------------------
+# Security config
+# ---------------------------------------------------------------------------
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "change-me-in-production-use-openssl-rand-hex-32")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+
+bearer_scheme = HTTPBearer()
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+asyncpg://purplegrid:purplegrid@purple-grid-db:5432/purplegrid"
+)
+
+engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
+# ---------------------------------------------------------------------------
+# ORM Models
+# ---------------------------------------------------------------------------
+class Base(DeclarativeBase):
+    pass
+
+
+class UserModel(Base):
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    hashed_password: Mapped[str] = mapped_column(String, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class ScanResultModel(Base):
+    __tablename__ = "scan_results"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    repo_url: Mapped[str] = mapped_column(String, nullable=False)
+    branch: Mapped[str] = mapped_column(String, default="main")
+    scan_depth: Mapped[str] = mapped_column(String, default="full")
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    risk_score: Mapped[float | None] = mapped_column(Numeric(4, 2), nullable=True)
+    total_vulns: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    raw_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# ---------------------------------------------------------------------------
 # App bootstrap
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Purple-Grid Vulnerability Scanner API",
     description="AI-powered vulnerability analysis microservice.",
-    version="1.0.0",
-    # Disable docs in production — expose only in non-prod environments.
+    version="3.0.0",
     docs_url="/docs" if os.getenv("ENV", "production") != "production" else None,
     redoc_url=None,
     openapi_url="/openapi.json" if os.getenv("ENV", "production") != "production" else None,
 )
 
-# ---------------------------------------------------------------------------
-# CORS — lock to explicit origins; never use wildcard in production.
-# ---------------------------------------------------------------------------
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -60,9 +123,40 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+async def startup():
+    # Verify DB connection on boot
+    async with engine.begin() as conn:
+        await conn.execute(text("SELECT 1"))
+    logger.info("database_connected")
+
+
 # ---------------------------------------------------------------------------
-# Request / Response schemas  (Pydantic v2)
+# Schemas
 # ---------------------------------------------------------------------------
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+    @field_validator("password")
+    @classmethod
+    def password_strength(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters.")
+        return v
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
 class ScanRequest(BaseModel):
     repo_url: HttpUrl
     branch: str = "main"
@@ -71,21 +165,21 @@ class ScanRequest(BaseModel):
     @field_validator("branch")
     @classmethod
     def branch_no_traversal(cls, v: str) -> str:
-        """Reject path-traversal attempts in the branch field."""
         if ".." in v or "/" in v:
             raise ValueError("Branch name must not contain path traversal sequences.")
         return v
 
 
 class Vulnerability(BaseModel):
-    cve_id: str
+    finding_id: str          # was cve_id — static analysis finds CWEs, not CVEs
+    engine: Literal["bandit", "semgrep"]
     severity: Literal["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
     cvss_score: float
+    cwe: str | None = None
     file_path: str
     line_number: int
+    title: str
     description: str
-    remediation: str
-
 
 class ScanResult(BaseModel):
     scan_id: str
@@ -98,104 +192,62 @@ class ScanResult(BaseModel):
     vulnerabilities: list[Vulnerability]
 
 
-# ---------------------------------------------------------------------------
-# Mock scan engine — replace with real ML inference in Phase 2.
-# ---------------------------------------------------------------------------
-_MOCK_VULNS: list[dict] = [
-    {
-        "cve_id": "CVE-2023-44487",
-        "severity": "HIGH",
-        "cvss_score": 7.5,
-        "file_path": "src/server/http2_handler.py",
-        "line_number": 142,
-        "description": "HTTP/2 Rapid Reset Attack allows resource exhaustion via stream cancellation.",
-        "remediation": "Upgrade to a patched HTTP/2 library version or apply server-side rate limiting on RESET frames.",
-    },
-    {
-        "cve_id": "CVE-2024-3094",
-        "severity": "CRITICAL",
-        "cvss_score": 10.0,
-        "file_path": "build/scripts/liblzma_hook.c",
-        "line_number": 87,
-        "description": "XZ Utils supply-chain backdoor enabling remote code execution via compromised liblzma.",
-        "remediation": "Pin dependency to xz-utils 5.4.x; audit all build scripts for injected hooks.",
-    },
-    {
-        "cve_id": "CVE-2023-29197",
-        "severity": "MEDIUM",
-        "cvss_score": 5.3,
-        "file_path": "api/validators.py",
-        "line_number": 33,
-        "description": "Improper header parsing allows HTTP header injection via unescaped newline characters.",
-        "remediation": "Sanitize all user-controlled values before embedding into HTTP response headers.",
-    },
-    {
-        "cve_id": "CVE-2022-42889",
-        "severity": "CRITICAL",
-        "cvss_score": 9.8,
-        "file_path": "utils/template_engine.py",
-        "line_number": 201,
-        "description": "Text4Shell: unsafe variable interpolation in Apache Commons Text enables RCE.",
-        "remediation": "Upgrade commons-text to >= 1.10.0; avoid StringSubstitutor with untrusted input.",
-    },
-    {
-        "cve_id": "CVE-2023-50164",
-        "severity": "CRITICAL",
-        "cvss_score": 9.8,
-        "file_path": "controllers/upload_controller.py",
-        "line_number": 58,
-        "description": "Apache Struts2 path traversal via file upload parameter allows arbitrary file write.",
-        "remediation": "Upgrade Struts2 to >= 6.3.0.2; validate and restrict upload directory paths.",
-    },
-    {
-        "cve_id": "CVE-2023-46604",
-        "severity": "CRITICAL",
-        "cvss_score": 10.0,
-        "file_path": "messaging/activemq_consumer.py",
-        "line_number": 17,
-        "description": "Apache ActiveMQ RCE via ClassInfo deserialization of untrusted OpenWire protocol data.",
-        "remediation": "Upgrade ActiveMQ to >= 5.15.16 or apply vendor patch; restrict broker access by IP.",
-    },
-    {
-        "cve_id": "CVE-2024-21626",
-        "severity": "HIGH",
-        "cvss_score": 8.6,
-        "file_path": "Dockerfile",
-        "line_number": 3,
-        "description": "runc container escape: working directory leaks host file descriptor enabling breakout.",
-        "remediation": "Upgrade runc to >= 1.1.12; apply OCI runtime patches from container vendor.",
-    },
-    {
-        "cve_id": "CVE-2023-38545",
-        "severity": "HIGH",
-        "cvss_score": 9.8,
-        "file_path": "deps/libcurl/socks5.c",
-        "line_number": 310,
-        "description": "libcurl SOCKS5 heap overflow during hostname resolution when CURLOPT_BUFFERSIZE is set.",
-        "remediation": "Upgrade libcurl to >= 8.4.0; avoid SOCKS5 proxies with untrusted hostnames.",
-    },
-]
-
-
-def _run_mock_scan(repo_url: str, branch: str, scan_depth: str) -> tuple[list[Vulnerability], int]:
-    """
-    Simulates ML scan latency and non-deterministic finding counts.
-    Phase 2 will wire this to the real inference engine.
-    """
-    start = time.time()
-
-    # Simulate variable scan latency (50–400 ms)
-    time.sleep(random.uniform(0.05, 0.4))
-
-    sample_size = len(_MOCK_VULNS) if scan_depth == "full" else len(_MOCK_VULNS) // 2
-    findings = [Vulnerability(**v) for v in random.sample(_MOCK_VULNS, k=random.randint(2, sample_size))]
-
-    duration_ms = int((time.time() - start) * 1000)
-    return findings, duration_ms
+class ScanHistoryItem(BaseModel):
+    scan_id: str
+    repo_url: str
+    branch: str
+    status: str
+    risk_score: float | None
+    total_vulns: int | None
+    created_at: str
+    completed_at: str | None
 
 
 # ---------------------------------------------------------------------------
-# Middleware — attach a correlation ID to every request for distributed tracing.
+# Auth helpers
+# ---------------------------------------------------------------------------
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return bcrypt.checkpw(plain.encode(), hashed.encode())
+
+
+def create_access_token(subject: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {"sub": subject, "exp": expire, "iat": datetime.now(timezone.utc)}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> UserModel:
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token.")
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    result = await db.execute(select(UserModel).where(UserModel.email == email))
+    user = result.scalar_one_or_none()
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token.")
+    return user
+
+
+
+
+# ---------------------------------------------------------------------------
+# Middleware
 # ---------------------------------------------------------------------------
 @app.middleware("http")
 async def attach_request_id(request: Request, call_next):
@@ -206,82 +258,155 @@ async def attach_request_id(request: Request, call_next):
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Auth routes
 # ---------------------------------------------------------------------------
-@app.get("/healthz", include_in_schema=False)
-async def liveness():
-    """Kubernetes liveness probe — returns 200 if the process is alive."""
-    return {"status": "ok"}
-
-
-@app.get("/readyz", include_in_schema=False)
-async def readiness():
-    """
-    Kubernetes readiness probe — in Phase 2 this will verify DB connectivity
-    and ML model load status before accepting traffic.
-    """
-    return {"status": "ready", "version": "1.0.0"}
-
-
-@app.post(
-    "/api/v1/scan",
-    response_model=ScanResult,
-    status_code=status.HTTP_200_OK,
-    summary="Submit a repository for vulnerability analysis",
-)
-async def scan_repository(payload: ScanRequest, request: Request):
-    """
-    Accepts a Git repository URL and returns a structured vulnerability report.
-
-    - **repo_url**: Fully-qualified HTTPS URL of the target repository.
-    - **branch**: Target branch (default: `main`).
-    - **scan_depth**: `shallow` (fast, top-level files) or `full` (deep AST + dependency graph).
-    """
-    scan_id = str(uuid.uuid4())
-    logger.info(
-        f"scan_started scan_id={scan_id} repo={payload.repo_url} branch={payload.branch}"
+@app.post("/auth/register", status_code=status.HTTP_201_CREATED)
+async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(UserModel).where(UserModel.email == payload.email))
+    if result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with this email already exists.",
+        )
+    user = UserModel(
+        email=payload.email,
+        hashed_password=hash_password(payload.password),
     )
+    db.add(user)
+    await db.flush()
+    logger.info(f"user_registered email={payload.email}")
+    return {"message": "Account created successfully."}
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(UserModel).where(UserModel.email == payload.email))
+    user = result.scalar_one_or_none()
+    if not user or not verify_password(payload.password, user.hashed_password):
+        logger.warning(f"login_failed email={payload.email}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password.",
+        )
+    token = create_access_token(subject=user.email)
+    logger.info(f"login_success email={payload.email}")
+    return TokenResponse(access_token=token, expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60)
+
+
+# ---------------------------------------------------------------------------
+# Scan routes
+# ---------------------------------------------------------------------------
+@app.post("/api/v1/scan", response_model=ScanResult, status_code=status.HTTP_200_OK)
+async def scan_repository(
+    payload: ScanRequest,
+    request: Request,
+    current_user: UserModel = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    scan_id = str(uuid.uuid4())
+    logger.info(f"scan_started scan_id={scan_id} user={current_user.email} repo={payload.repo_url}")
 
     try:
-        findings, duration_ms = _run_mock_scan(
-            str(payload.repo_url), payload.branch, payload.scan_depth
-        )
+        scan = await scanner.run_scan(str(payload.repo_url), payload.branch, payload.scan_depth)
+        findings = [Vulnerability(**v) for v in scan["vulnerabilities"]]
+        duration_ms = scan["duration_ms"]
+    except scanner.ScanError as exc:
+        logger.warning(f"scan_rejected scan_id={scan_id} reason={exc}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     except Exception as exc:
         logger.error(f"scan_failed scan_id={scan_id} error={exc}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Scan engine encountered an internal error.",
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Scan engine encountered an internal error.")
 
     severity_counts: dict[str, int] = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
     for v in findings:
         severity_counts[v.severity] += 1
 
-    result = ScanResult(
+    risk_score = round(sum(v.cvss_score for v in findings) / max(len(findings), 1), 2)
+    scanned_at = datetime.now(timezone.utc)
+
+    # Persist to DB
+    db_scan = ScanResultModel(
+        id=uuid.UUID(scan_id),
+        user_id=current_user.id,
+        repo_url=str(payload.repo_url),
+        branch=payload.branch,
+        scan_depth=payload.scan_depth,
+        status="completed",
+        risk_score=risk_score,
+        total_vulns=len(findings),
+        raw_payload={
+            "summary": {"total_vulnerabilities": len(findings), "severity_breakdown": severity_counts, "risk_score": risk_score},
+            "vulnerabilities": [v.model_dump() for v in findings],
+        },
+        created_at=scanned_at,
+        completed_at=scanned_at,
+    )
+    db.add(db_scan)
+    await db.flush()
+
+    logger.info(f"scan_completed scan_id={scan_id} user={current_user.email} total={len(findings)}")
+
+    return ScanResult(
         scan_id=scan_id,
         status="completed",
         repo_url=str(payload.repo_url),
         branch=payload.branch,
-        scanned_at=datetime.now(timezone.utc).isoformat(),
+        scanned_at=scanned_at.isoformat(),
         duration_ms=duration_ms,
-        summary={
-            "total_vulnerabilities": len(findings),
-            "severity_breakdown": severity_counts,
-            "risk_score": round(
-                sum(v.cvss_score for v in findings) / max(len(findings), 1), 2
-            ),
-        },
+        summary={"total_vulnerabilities": len(findings), "severity_breakdown": severity_counts, "risk_score": risk_score},
         vulnerabilities=findings,
     )
 
-    logger.info(
-        f"scan_completed scan_id={scan_id} total={len(findings)} duration_ms={duration_ms}"
+
+@app.get("/api/v1/scans/{scan_id}", response_model=ScanResult)
+async def get_scan(
+    scan_id: str,
+    current_user: UserModel = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # Validate the path param is a real UUID — reject garbage before hitting the DB.
+    try:
+        scan_uuid = uuid.UUID(scan_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid scan ID format.")
+
+    result = await db.execute(
+        select(ScanResultModel).where(
+            ScanResultModel.id == scan_uuid,
+            ScanResultModel.user_id == current_user.id,   # IDOR protection: only your own scans
+        )
     )
-    return result
+    scan = result.scalar_one_or_none()
+    if scan is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found.")
+
+    payload = scan.raw_payload or {}
+    return ScanResult(
+        scan_id=str(scan.id),
+        status=scan.status,
+        repo_url=scan.repo_url,
+        branch=scan.branch,
+        scanned_at=scan.created_at.isoformat(),
+        duration_ms=payload.get("duration_ms", 0),
+        summary=payload.get("summary", {}),
+        vulnerabilities=payload.get("vulnerabilities", []),
+    )
+
+# ---------------------------------------------------------------------------
+# Health probes
+# ---------------------------------------------------------------------------
+@app.get("/healthz", include_in_schema=False)
+async def liveness():
+    return {"status": "ok"}
+
+
+@app.get("/readyz", include_in_schema=False)
+async def readiness():
+    return {"status": "ready", "version": "3.0.0"}
 
 
 # ---------------------------------------------------------------------------
-# Global exception handler — never leak stack traces to the client.
+# Global exception handler
 # ---------------------------------------------------------------------------
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):

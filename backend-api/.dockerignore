@@ -24,7 +24,7 @@
 # Virtual environments — can be gigabytes; deps are installed fresh in the build.
 .venv/
 venv/
-env/
+env/  
 ENV/
 __pypackages__/
 
