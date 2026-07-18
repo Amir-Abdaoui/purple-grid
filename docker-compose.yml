@@ -1,0 +1,70 @@
+version: "3.9"
+
+services:
+
+  db:
+    image: postgres:16.3-alpine3.20
+    container_name: purple-grid-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-purplegrid}
+      POSTGRES_USER: ${POSTGRES_USER:-pguser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init-scripts:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pguser -d purplegrid"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend-api:
+    build:
+      context: ./backend-api
+      dockerfile: Dockerfile
+    container_name: purple-grid-api
+    restart: unless-stopped
+    environment:
+      ENV: development
+      LOG_LEVEL: INFO
+      ALLOWED_ORIGINS: "http://localhost:3000"
+      DATABASE_URL: postgresql://pguser:${POSTGRES_PASSWORD}@db:5432/purplegrid
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      - backend-net
+      - frontend-net
+    depends_on:
+      db:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    user: "10001:10001"
+
+  frontend:
+    image: node:20.15-alpine3.20
+    container_name: purple-grid-frontend
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - frontend-net
+    command: echo "Frontend stub ready - Phase 2"
+    environment:
+      NEXT_PUBLIC_API_URL: "http://localhost:8000"
+
+volumes:
+  postgres_data:
+
+networks:
+  backend-net:
+    driver: bridge
+  frontend-net:
+    driver: bridge
