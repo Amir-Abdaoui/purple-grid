@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
-
+import tempfile
 import httpx
 
 logger = logging.getLogger("purple-grid.scanner")
@@ -28,7 +28,8 @@ MAX_ARCHIVE_BYTES = 40 * 1024 * 1024        # reject repos > 40 MB compressed
 MAX_UNCOMPRESSED_BYTES = 250 * 1024 * 1024  # reject decompression bombs
 DOWNLOAD_TIMEOUT = 30.0
 SCAN_TIMEOUT = 120.0
-TMP_ROOT = "/tmp"                            # only writable path (tmpfs)
+
+tmp_dir = tempfile.mkdtemp()                        # only writable path (tmpfs)
 
 # --- SSRF protection: GitHub only ------------------------------------------
 _ALLOWED_HOSTS = {"github.com", "www.github.com"}
