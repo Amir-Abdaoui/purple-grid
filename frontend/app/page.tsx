@@ -1,32 +1,23 @@
 "use client";
 import { useEffect, useState } from "react";
 import { isLoggedIn, clearToken } from "@/lib/api";
-import LoginForm from "@/components/LoginForm";
-import Dashboard from "@/components/Dashboard";
+import LoginPage from "../components/LoginPage";
+import Dashboard from "../components/Dashboard";
 
 export default function Home() {
   const [loggedIn, setLoggedIn] = useState(false);
+  const [mounted, setMounted] = useState(false);
 
   useEffect(() => {
+    setMounted(true);
     setLoggedIn(isLoggedIn());
   }, []);
 
-  function handleLogin() {
-    setLoggedIn(true);
-  }
+  if (!mounted) return null;
 
-  function handleLogout() {
-    clearToken();
-    setLoggedIn(false);
-  }
-
-  return (
-    <main className="min-h-screen bg-gray-950 text-gray-100">
-      {loggedIn ? (
-        <Dashboard onLogout={handleLogout} />
-      ) : (
-        <LoginForm onLogin={handleLogin} />
-      )}
-    </main>
+  return loggedIn ? (
+    <Dashboard onLogout={() => { clearToken(); setLoggedIn(false); }} />
+  ) : (
+    <LoginPage onLogin={() => setLoggedIn(true)} />
   );
 }
