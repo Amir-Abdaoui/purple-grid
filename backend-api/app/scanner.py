@@ -255,7 +255,7 @@ def run_real_scan(repo_url: str, branch: str, scan_depth: str, min_severity: str
     import time
     start = time.time()
 
-    with tempfile.TemporaryDirectory(prefix="pg_scan_", dir="/tmp/scans") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="pg_scan_") as tmpdir:
         repo_path = f"{tmpdir}/repo"
 
         logger.info(f"cloning repo_url={repo_url} branch={branch}")
